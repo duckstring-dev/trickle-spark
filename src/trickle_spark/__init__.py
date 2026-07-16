@@ -10,13 +10,15 @@ from . import (
     acc,  # noqa: F401 - the scan-metric namespace (from trickle_spark import acc)
     agg,  # noqa: F401 - the aggregate-metric namespace (from trickle_spark import agg)
 )
-from .builder import Builder, BuildError, materialize, source
+from .append import AppendConflict, run_append
+from .builder import Builder, BuildError, materialize, materialize_append, source
 from .changes import delta_of
 from .run import RunContext, RunResult, run
 from .tables import Pin, read_watermarks
 from .zset import D_COL, SYSTEM_PREFIX, Delta, as_zset, consolidate, diff
 
 __all__ = [
+    "AppendConflict",
     "BuildError",
     "Builder",
     "D_COL",
@@ -30,7 +32,9 @@ __all__ = [
     "delta_of",
     "diff",
     "materialize",
+    "materialize_append",
     "read_watermarks",
     "run",
+    "run_append",
     "source",
 ]

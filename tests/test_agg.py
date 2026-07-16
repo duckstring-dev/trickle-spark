@@ -199,3 +199,149 @@ def test_aggregate_build_errors(spark, db):
     with pytest.raises(BuildError, match="operand"):
         ts.source(f"{db}.lines").join(
             ts.source(f"{db}.lines").alias("l2").aggregate(by="product", n=agg.count()), on="product")
+    with pytest.raises(BuildError, match="along"):
+        ts.source(f"{db}.lines").aggregate(by="product", r=agg.reduce(lambda st, row: (st, st), 0))
+    with pytest.raises(BuildError, match="share"):
+        (ts.source(f"{db}.lines").along("line_id")
+         .aggregate(by="product", r=agg.reduce(lambda st, row: (st, st), 0), n=agg.count()))
+
+
+# ─── two-variable co-moments ─────────────────────────────────────────────────────
+
+
+def points(spark, db):
+    make_source(
+        spark,
+        f"{db}.points",
+        [(1, "A", 1.0, 2.5), (2, "A", 2.0, 4.0), (3, "A", 3.0, 6.5), (4, "B", 10.0, 1.0), (5, "B", 20.0, 3.0)],
+        schema="pt_id INT, grp STRING, x DOUBLE, y DOUBLE",
+    )
+
+
+def co_oracle(spark, db):
+    rows = spark.sql(
+        f"SELECT grp, covar_samp(x, y) c, covar_pop(x, y) cp, corr(x, y) r, "
+        f"regr_slope(y, x) sl, regr_intercept(y, x) ic FROM {db}.points GROUP BY grp"
+    ).collect()
+    return {r.grp: (r.c, r.cp, r.r, r.sl, r.ic) for r in rows}
+
+
+def test_co_moments_track_spark_through_mixed_windows(spark, db):
+    points(spark, db)
+    out = f"{db}.fits"
+    plan = (ts.source(f"{db}.points", p=1.0)
+            .aggregate(by="grp", c=agg.covariance("x", "y"), cp=agg.covariance("x", "y", "pop"),
+                       r=agg.pearson_correlation("x", "y"), sl=agg.ols_slope("x", "y"),
+                       ic=agg.ols_intercept("x", "y")))
+
+    def check():
+        oracle = co_oracle(spark, db)
+        got = {r[0]: r[1:] for r in table_rows(spark, out, "grp", "c", "cp", "r", "sl", "ic")}
+        assert set(got) == set(oracle)
+        for grp, want in oracle.items():
+            for have, expect in zip(got[grp], want, strict=True):
+                if expect is None:
+                    assert have is None
+                else:
+                    assert have == pytest.approx(expect, rel=1e-9, abs=1e-12)
+
+    res = plan.merge_into(spark, out)
+    assert res.status == "bootstrap"
+    check()
+
+    spark.sql(f"INSERT INTO {db}.points VALUES (6, 'A', 4.0, 8.0), (7, 'B', 30.0, 2.0)")
+    res = plan.merge_into(spark, out)
+    assert res.status == "incremental"
+    check()
+
+    spark.sql(f"UPDATE {db}.points SET y = 9.5 WHERE pt_id = 3")  # a retraction + re-insert folds through
+    res = plan.merge_into(spark, out)
+    assert res.status == "incremental"
+    check()
+
+    spark.sql(f"DELETE FROM {db}.points WHERE pt_id IN (1, 7)")
+    res = plan.merge_into(spark, out)
+    assert res.status == "incremental"
+    check()
+    # only the touched groups reach the change feed
+    assert {r.grp for r in cdf_at(spark, out, latest_version(spark, out))} == {"A", "B"}
+
+
+def test_co_moments_pairwise_null_and_degenerate_groups(spark, db):
+    make_source(
+        spark,
+        f"{db}.points",
+        [(1, "A", 1.0, 2.0), (2, "A", 2.0, None), (3, "A", 3.0, 4.0), (4, "C", 5.0, 7.0)],
+        schema="pt_id INT, grp STRING, x DOUBLE, y DOUBLE",
+    )
+    out = f"{db}.fits"
+    plan = (ts.source(f"{db}.points", p=1.0)
+            .aggregate(by="grp", c=agg.covariance("x", "y"), r=agg.pearson_correlation("x", "y"),
+                       sl=agg.ols_slope("x", "y")))
+    plan.merge_into(spark, out)
+    got = {r[0]: r[1:] for r in table_rows(spark, out, "grp", "c", "r", "sl")}
+    # A: the NULL-y row is pairwise-deleted → the (1,2),(3,4) pair line, slope 1
+    assert got["A"][0] == pytest.approx(2.0)
+    assert got["A"][1] == pytest.approx(1.0)
+    assert got["A"][2] == pytest.approx(1.0)
+    # C: a single pair — sample covariance, correlation, and slope are all undefined
+    assert got["C"] == (None, None, None)
+
+    spark.sql(f"INSERT INTO {db}.points VALUES (5, 'C', 6.0, 9.0)")  # a second pair makes them defined
+    plan.merge_into(spark, out)
+    got = {r[0]: r[1:] for r in table_rows(spark, out, "grp", "c", "r", "sl")}
+    assert got["C"][0] == pytest.approx(1.0)
+    assert got["C"][2] == pytest.approx(2.0)
+
+
+# ─── the ordered reduce (agg.reduce) ─────────────────────────────────────────────
+
+
+def reduce_plan(db):
+    # nested so cloudpickle ships it by value — a reducer must be self-contained on the executors
+    def trail_fn(st, row):
+        st = st + [row["event_id"]]
+        return st, ",".join(str(i) for i in st)
+
+    return (
+        ts.source(f"{db}.events", p=1.0)
+        .along("t")
+        .aggregate(by="grp", trail=agg.reduce(trail_fn, [], dtype="string"))
+    )
+
+
+def events(spark, db):
+    make_source(
+        spark,
+        f"{db}.events",
+        [(1, "g1", 1, 10.0), (2, "g1", 2, 20.0), (3, "g2", 1, 5.0)],
+        schema="event_id INT, grp STRING, t INT, x DOUBLE",
+    )
+
+
+def test_ordered_reduce_folds_tail_and_refolds_past(spark, db):
+    events(spark, db)
+    out = f"{db}.trails"
+    plan = reduce_plan(db)
+    res = plan.merge_into(spark, out)  # pk defaults to the group key
+    assert res.status == "bootstrap"
+    assert table_rows(spark, out, "grp", "trail") == [("g1", "1,2"), ("g2", "3")]
+
+    spark.sql(f"INSERT INTO {db}.events VALUES (4, 'g1', 3, 1.0)")  # a tail append resumes carried state
+    res = plan.merge_into(spark, out)
+    assert res.status == "incremental"
+    assert table_rows(spark, out, "grp", "trail") == [("g1", "1,2,4"), ("g2", "3")]
+    assert {r.grp for r in cdf_at(spark, out, latest_version(spark, out))} == {"g1"}
+
+    spark.sql(f"DELETE FROM {db}.events WHERE event_id = 1")  # a past change re-folds the group
+    res = plan.merge_into(spark, out)
+    assert res.status == "incremental"
+    assert table_rows(spark, out, "grp", "trail") == [("g1", "2,4"), ("g2", "3")]
+
+    spark.sql(f"DELETE FROM {db}.events WHERE grp = 'g2'")  # an emptied group is retracted
+    res = plan.merge_into(spark, out)
+    assert res.status == "incremental"
+    assert table_rows(spark, out, "grp", "trail") == [("g1", "2,4")]
+
+    res = plan.merge_into(spark, out)  # nothing new → skip
+    assert res.status == "skipped"

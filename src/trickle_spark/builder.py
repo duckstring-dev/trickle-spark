@@ -319,7 +319,8 @@ class Builder:
 
     def accumulate(self, by=None, **metrics) -> "Builder":
         """Enrich **each** row with order-dependent **running** values — a per-row scan in
-        :meth:`along` order partitioned by ``by``, using :mod:`trickle_spark.acc` specs. Not a
+        :meth:`along` order partitioned by ``by`` (omit ``by`` for an **ungrouped** scan over the whole
+        table — sound, but a single serial fold), using :mod:`trickle_spark.acc` specs. Not a
         reduction (output cardinality = input); terminal-bound to :meth:`merge_into`, which is
         retraction-aware (see ``accumulate.py``). ``pk`` on the terminal is required — the output is
         keyed by row identity, not by the group."""
@@ -329,8 +330,6 @@ class Builder:
         if self._along is None:
             raise BuildError(".accumulate() needs an order axis — call .along('col') first")
         by = normalize_pk(by)
-        if not by:
-            raise BuildError(".accumulate() needs a group key, by=… (an ungrouped scan is not supported yet)")
         if not metrics:
             raise BuildError(".accumulate() needs ≥1 metric, e.g. total=acc.sum('qty')")
         for out, m in metrics.items():
@@ -348,7 +347,11 @@ class Builder:
     def aggregate(self, by=None, **metrics) -> "Builder":
         """Group the composed output by ``by`` and maintain the ``metrics`` incrementally (see
         ``aggregate.py`` — raw accumulators in a state companion, O(δ) folds, retraction rescans). The
-        output ``pk`` defaults to the group key. Terminal-bound to :meth:`merge_into`."""
+        output ``pk`` defaults to the group key. Terminal-bound to :meth:`merge_into`.
+
+        ``agg.reduce(fn, init)`` metrics are the **order-dependent** exception: they need an
+        :meth:`along` axis and can't share an ``.aggregate()`` with order-independent metrics (they run
+        on the accumulate machinery — see ``accumulate.py:run_reduce``)."""
         self._ensure_composable("aggregate")
         from .agg import Metric
 
@@ -362,6 +365,11 @@ class Builder:
         for out, m in metrics.items():
             if not isinstance(m, Metric):
                 raise BuildError(f"aggregate metric '{out}' must be an agg.* spec (e.g. agg.sum/mean/var)")
+        if any(m.kind == "reduce" for m in metrics.values()):
+            if self._along is None:
+                raise BuildError("agg.reduce(...) is order-dependent — call .along('col') before .aggregate()")
+            if not all(m.kind == "reduce" for m in metrics.values()):
+                raise BuildError("agg.reduce(...) can't share an .aggregate() with other metrics — split them")
         self._agg = {"by": by, "metrics": dict(metrics)}
         return self
 
@@ -376,6 +384,35 @@ class Builder:
         ``key_filter=False`` keeps the delta composition but skips the ``key ∈ K`` pre-filter — manual
         escapes, measure before reaching for them."""
         return materialize(spark, output, self, pk=pk, ivm=ivm, key_filter=key_filter)
+
+    def append_to(
+        self,
+        spark,
+        output: str,
+        *,
+        pk=None,
+        fail_on_conflict: bool = True,
+        log_drops: bool = True,
+        ivm: bool = True,
+        key_filter: bool = True,
+    ) -> RunResult:
+        """Run one maintenance step of this plan into the **append-only** Delta table ``output`` — for
+        a *monotonic* transform whose output rows are only ever added, never updated or retracted
+        (e.g. an append-only fact stream joined to stable dims). New rows are appended in one commit
+        carrying the watermarks; nothing is ever updated or deleted, so the table is a true insert-only
+        history (its CDF is inserts only).
+
+        An insert-only table can't reflect a change to the past, so two things are **conflicts**: a
+        retraction reaching the output, and a ``+1`` row whose ``pk`` is already in the table with a
+        *different* image. An identical image is a benign idempotent skip. ``fail_on_conflict=True``
+        (default) raises before writing anything; ``False`` drops the conflicting rows (history wins)
+        and, with ``log_drops``, records them in a ``{output}__trickle_droplog`` companion. ``pk=None``
+        skips the pk checks entirely (only retractions conflict) — fast, sound only when duplicates
+        and past-changes are impossible by construction. See ``append.py``."""
+        return materialize_append(
+            spark, output, self, pk=pk, fail_on_conflict=fail_on_conflict, log_drops=log_drops,
+            ivm=ivm, key_filter=key_filter,
+        )
 
     def schema(self, spark) -> dict[str, str]:
         """``{column: Spark type}`` for this plan's output — introspection over the live tables."""
@@ -427,11 +464,7 @@ def materialize(
         )
 
     if plan._agg is not None:
-        from .aggregate import run_aggregate
-
-        return run_aggregate(
-            spark,
-            output,
+        runner_kwargs = dict(
             by=plan._agg["by"],
             metrics=plan._agg["metrics"],
             pk=normalize_pk(pk) or plan._agg["by"],
@@ -440,6 +473,13 @@ def materialize(
             compiler_factory=lambda ctx: _Compiler(ctx, plan, key_filter=key_filter),
             ivm=ivm and plan._sql_query is None,
         )
+        if any(m.kind == "reduce" for m in plan._agg["metrics"].values()):
+            from .accumulate import run_reduce
+
+            return run_reduce(spark, output, along=plan._along, **runner_kwargs)
+        from .aggregate import run_aggregate
+
+        return run_aggregate(spark, output, **runner_kwargs)
 
     out_pk = normalize_pk(pk)
     if not out_pk:
@@ -459,6 +499,55 @@ def materialize(
         return zset
 
     return run(spark, output, sources=sources, pk=out_pk, full=full, delta=delta, p=p_map)
+
+
+def materialize_append(
+    spark,
+    output: str,
+    plan: Builder,
+    *,
+    pk,
+    fail_on_conflict: bool = True,
+    log_drops: bool = True,
+    ivm: bool = True,
+    key_filter: bool = True,
+) -> RunResult:
+    """One maintenance step landing on an **append-only** output (see :meth:`Builder.append_to`).
+    The plan composes exactly as for :func:`materialize`; only the apply differs — a comprehensive
+    result is tagged ``+1`` and append-filtered against history rather than diffed, and the run is
+    handled by :func:`~.append.run_append`."""
+    from .append import run_append
+
+    if plan._agg is not None:
+        raise BuildError(".append_to() can't follow .aggregate() — an aggregate updates groups; use .merge_into()")
+    if plan._acc is not None:
+        raise BuildError(
+            ".append_to() can't follow .accumulate() — the scan's terminal is .merge_into() "
+            "(retraction-aware; a tail-only stream lands as pure appends through it anyway)"
+        )
+    out_pk = normalize_pk(pk)
+    leaves = plan._leaves()
+    sources = list(dict.fromkeys(leaf.ref for leaf in leaves))
+    p_map = {leaf.ref: leaf.p for leaf in leaves}
+
+    def full(ctx: RunContext) -> DataFrame:
+        df = _Compiler(ctx, plan).current()
+        if out_pk:
+            _require_pk(out_pk, df.columns, output)
+        return df
+
+    def delta(ctx: RunContext) -> DataFrame | None:
+        if not ivm or plan._sql_query is not None:
+            return None  # comprehensive: run_append tags full() +1 and append-filters it
+        zset = _Compiler(ctx, plan, key_filter=key_filter).delta()
+        if zset is not None and out_pk:
+            _require_pk(out_pk, [c for c in zset.columns if c != D_COL], output)
+        return zset
+
+    return run_append(
+        spark, output, sources=sources, pk=out_pk, full=full, delta=delta, p=p_map,
+        fail_on_conflict=fail_on_conflict, log_drops=log_drops,
+    )
 
 
 def _require_pk(out_pk, cols, output: str) -> None:

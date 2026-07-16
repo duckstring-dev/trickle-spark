@@ -73,7 +73,11 @@ Distributive metrics fold in O(δ) from accumulators kept in a `…__trickle_agg
 `var`/`stddev` are maintained by the numerically stable Chan/Pébay centred-moment merge; `min`/`max`/
 `argmin`/`argmax`/`bool_*`/`bit_*` extend in place on inserts and rescan a group's current membership
 only when it saw a retraction. Also available: the weighted family (`weight_total`, `weighted_sum`,
-`weighted_average`) and a retractable `product`.
+`weighted_average`), a retractable `product`, and the two-variable co-moments (`covariance`,
+`pearson_correlation`, `ols_slope`, `ols_intercept`) maintained by the same Pébay merge over pairwise
+non-NULL rows. `agg.reduce(fn, init)` is the order-dependent exception — a custom fold in `.along`
+order collapsed to one value per group (a tail append resumes the group's carried state; a past edit
+re-folds it).
 
 ### Ordered scans
 
@@ -91,7 +95,24 @@ from trickle_spark import acc
 `.accumulate()` enriches **every row** with running values in `.along` order within its group. A
 tail-only append resumes each group's carried fold-state (O(new)); an edit or delete in a group's past
 re-folds that group and diffs, so only rows whose running values actually changed hit the output's
-change feed. `acc.scan(fn, init)` is the custom-fold escape hatch.
+change feed. `acc.scan(fn, init)` is the custom-fold escape hatch. Omit `by` for an **ungrouped**
+scan over the whole table — sound, but one serial fold by construction.
+
+### Append-only outputs
+
+```python
+(ts.source("shop.orders").alias("o")
+ .filter("o.qty > 0")
+ .append_to(spark, "shop.order_log", pk=("order_id",)))
+```
+
+For a **monotonic** transform — output rows only ever added, never updated or retracted —
+`.append_to` lands pure insert commits (the output's CDF carries no updates or deletes) instead of a
+MERGE. A retraction reaching the output, or a `pk` colliding with a *different* image, is a
+**conflict**: the default raises before writing anything; `fail_on_conflict=False` drops the
+conflicting rows (history wins, the past stays frozen) and, with `log_drops`, records them in a
+`{output}__trickle_droplog` companion table. An identical image is a benign idempotent skip, so a
+comprehensive re-derivation never spuriously fails — and never rewrites the past.
 
 ### Escape hatch
 
@@ -161,12 +182,14 @@ run-scoped happens lazily inside the call.
 
 ## Status / not yet ported
 
-The reference implementation and behavioural oracle is duckstring's `trickle/` package; the port so
-far covers the core io, the full join DAG (all six `how`s, bushy shapes, the affected-key recompute
-with a broadcast null-safe key pre-filter), aggregation, and ordered scans. Documented follow-ups:
-two-variable co-moments (`covariance`/`pearson_correlation`/`ols_*`), `agg.reduce`, an `.append_to`
-terminal with droplog conflict semantics, an explicit-changelog change source (user-controlled
-epochs) behind the `delta_of` seam, and ungrouped scans.
+The reference implementation and behavioural oracle is duckstring's `trickle/` package; the port
+covers the core io, the full join DAG (all six `how`s, bushy shapes, the affected-key recompute with
+a broadcast null-safe key pre-filter), aggregation — including the two-variable co-moments and the
+order-dependent `agg.reduce` — ordered scans (grouped and ungrouped), and the `.append_to` terminal
+with droplog conflict semantics. Documented follow-ups: an explicit-changelog change source
+(user-controlled epochs) behind the `delta_of` seam — pending a real cross-system use case — and the
+reference's own deferred set (skewness, holistic aggregates / `DISTINCT`), which stay a downstream
+`.sql()` step here as there.
 
 ## Development
 

@@ -4,10 +4,13 @@
 > (`plans/trickle-spark.md`) when the package was extracted here — "this repo" in the text below
 > means duckstring, where the port was built in-tree beside the reference implementation.
 
-Status: **built through Phase 4** (core io, builder DAG, aggregate, accumulate — 41 tests green on a
-local Delta session; Phase 5 docs/CI landed with it). Deferred within the build, beyond the plan's own
-deferred list: two-variable co-moments + `agg.reduce`, ungrouped scans, in-place output schema
-evolution. A standalone port of Trickle's DBSP semantics (Z-sets, changed-key
+Status: **built through Phase 4** (core io, builder DAG, aggregate, accumulate — green on a local
+Delta session; Phase 5 docs/CI landed with it), then **extracted to this repo**. Since extraction the
+build's own deferred list has been closed out: two-variable co-moments, `agg.reduce`, ungrouped
+scans, and the `.append_to` terminal with droplog conflict semantics are in; still deferred are the
+explicit-changelog change source (pending a cross-system use case), in-place output schema evolution
+(a non-goal — see the README), and the reference's own deferred set (skewness, holistic
+aggregates/DISTINCT). A standalone port of Trickle's DBSP semantics (Z-sets, changed-key
 incremental joins, retractable aggregation) to **Apache Spark + Delta Lake**, aimed first at Databricks
 but engine-wise pure OSS. Built in this repo for proximity to the reference implementation and its test
 suite, then **extracted to its own repo/distribution** (`trickle-spark` on PyPI) once it stands — the same

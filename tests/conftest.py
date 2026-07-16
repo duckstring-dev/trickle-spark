@@ -51,6 +51,9 @@ def spark():
     builder = (
         SparkSession.builder.appName("trickle-spark-tests")
         .master("local[2]")
+        # The whole suite shares one driver JVM, and cached/localCheckpointed frames plus Delta
+        # snapshot state accumulate across ~50 tests — the 1g default heap OOMs near the end.
+        .config("spark.driver.memory", "4g")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.sql.warehouse.dir", warehouse)
@@ -85,3 +88,4 @@ def db(spark):
     spark.sql(f"CREATE DATABASE {name}")
     yield name
     spark.sql(f"DROP DATABASE {name} CASCADE")
+    spark.catalog.clearCache()  # release this test's cached/checkpointed blocks from the shared heap

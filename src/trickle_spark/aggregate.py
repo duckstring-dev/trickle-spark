@@ -2,6 +2,7 @@
 
 Raw accumulators live in a **state companion** Delta table ``{output}__trickle_aggstate`` (per additive
 column a running sum, non-NULL count and centred moment M2; per extreme a stored min & max; per
+co-moment pair the paired ``(n, Σx, Σy, M2x, M2y, Cxy)`` over rows where both are non-NULL; per
 weighted unit Σ(w·x), Σw and a pair count; per argmin/argmax the supporting key + payload; per
 semigroup the reduced value; per product the sign/zero counts + Σ log|x|). The published output holds
 only the derived user columns — a clean table like any other trickle-spark output.
@@ -53,6 +54,7 @@ def _q(name: str) -> str:
 class _Families:
     add_cols: list  # sum/mean/var/stddev input columns (Σx, non-NULL count, M2 each)
     ext_cols: list  # min/max input columns
+    co_pairs: list  # (x, y) pairs — covariance/pearson_correlation/ols_slope/ols_intercept
     wgt_units: list  # (x | None, w) pairs — weighted_sum/weighted_average, or weight_total (x=None)
     arg_specs: list  # (arg, key, "min" | "max")
     sg_specs: list  # (col, kind) for bool_and/bool_or/bit_and/bit_or
@@ -63,8 +65,11 @@ class _Families:
         return bool(self.ext_cols or self.arg_specs or self.sg_specs)
 
 
+_CO_KINDS = ("covariance", "pearson_correlation", "ols_slope", "ols_intercept")
+
+
 def classify(metrics) -> _Families:
-    add, ext, wgt, arg, sg, prod = [], [], [], [], [], []
+    add, ext, co, wgt, arg, sg, prod = [], [], [], [], [], [], []
 
     def put(bucket, item):
         if item not in bucket:
@@ -75,6 +80,8 @@ def classify(metrics) -> _Families:
             put(add, m.col)
         elif m.kind in ("min", "max"):
             put(ext, m.col)
+        elif m.kind in _CO_KINDS:
+            put(co, (m.col, m.col2))
         elif m.kind == "weight_total":
             put(wgt, (None, m.col))
         elif m.kind in ("weighted_sum", "weighted_average"):
@@ -87,7 +94,7 @@ def classify(metrics) -> _Families:
             put(prod, m.col)
         elif m.kind != "count":
             raise ValueError(f"agg metric kind {m.kind!r} is not supported by trickle-spark yet")
-    return _Families(add, ext, wgt, arg, sg, prod)
+    return _Families(add, ext, co, wgt, arg, sg, prod)
 
 
 def required_columns(by, metrics) -> list[str]:
@@ -105,6 +112,8 @@ def acc_columns(fams: _Families) -> list[str]:
         cols += [f"_a_sum_{i}", f"_a_cnt_{i}", f"_a_m2_{i}"]
     for j in range(len(fams.ext_cols)):
         cols += [f"_a_min_{j}", f"_a_max_{j}"]
+    for k in range(len(fams.co_pairs)):
+        cols += [f"_c_n_{k}", f"_c_sx_{k}", f"_c_sy_{k}", f"_c_m2x_{k}", f"_c_m2y_{k}", f"_c_cxy_{k}"]
     for m in range(len(fams.wgt_units)):
         cols += [f"_w_num_{m}", f"_w_den_{m}", f"_w_cnt_{m}"]
     for a in range(len(fams.arg_specs)):
@@ -130,6 +139,19 @@ def rebuild_state(inp: DataFrame, by, fams: _Families) -> DataFrame:
         ]
     for j, c in enumerate(fams.ext_cols):
         exprs += [f"min({_q(c)}) AS _a_min_{j}", f"max({_q(c)}) AS _a_max_{j}"]
+    for k, (x, y) in enumerate(fams.co_pairs):
+        # Spark's regression aggregates are the numerically stable rebuild: regr_sxx(y, x) = Σ(x−x̄)²,
+        # regr_syy = Σ(y−ȳ)², regr_sxy = Σ(x−x̄)(y−ȳ) — each over the pairwise non-NULL rows.
+        xq, yq = _q(x), _q(y)
+        paired = f"{xq} IS NOT NULL AND {yq} IS NOT NULL"
+        exprs += [
+            f"CAST(coalesce(regr_count({yq}, {xq}), 0) AS BIGINT) AS _c_n_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {paired} THEN {xq} END), 0.0) AS DOUBLE) AS _c_sx_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {paired} THEN {yq} END), 0.0) AS DOUBLE) AS _c_sy_{k}",
+            f"CAST(coalesce(regr_sxx({yq}, {xq}), 0.0) AS DOUBLE) AS _c_m2x_{k}",
+            f"CAST(coalesce(regr_syy({yq}, {xq}), 0.0) AS DOUBLE) AS _c_m2y_{k}",
+            f"CAST(coalesce(regr_sxy({yq}, {xq}), 0.0) AS DOUBLE) AS _c_cxy_{k}",
+        ]
     for m, (x, w) in enumerate(fams.wgt_units):
         both = f"{_q(w)} IS NOT NULL" if x is None else f"{_q(x)} IS NOT NULL AND {_q(w)} IS NOT NULL"
         num = "CAST(0.0 AS DOUBLE)" if x is None else f"coalesce(sum(CASE WHEN {both} THEN {_q(w)} * {_q(x)} END), 0.0)"
@@ -172,6 +194,17 @@ def fold_delta(zset: DataFrame, by, fams: _Families) -> DataFrame:
             f"min(CASE WHEN {d} > 0 THEN {_q(c)} END) AS _e_minp_{j}",
             f"max(CASE WHEN {d} > 0 THEN {_q(c)} END) AS _e_maxp_{j}",
         ]
+    for k, (x, y) in enumerate(fams.co_pairs):
+        xq, yq = _q(x), _q(y)
+        pr = f"{xq} IS NOT NULL AND {yq} IS NOT NULL"
+        exprs += [
+            f"CAST(coalesce(sum(CASE WHEN {d} > 0 AND {pr} THEN {d} ELSE 0 END), 0) AS BIGINT) AS _cni_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {d} > 0 AND {pr} THEN {d} * {xq} END), 0.0) AS DOUBLE) AS _csxi_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {d} > 0 AND {pr} THEN {d} * {yq} END), 0.0) AS DOUBLE) AS _csyi_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {d} < 0 AND {pr} THEN -{d} ELSE 0 END), 0) AS BIGINT) AS _cnd_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {d} < 0 AND {pr} THEN -{d} * {xq} END), 0.0) AS DOUBLE) AS _csxd_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {d} < 0 AND {pr} THEN -{d} * {yq} END), 0.0) AS DOUBLE) AS _csyd_{k}",
+        ]
     for m, (x, w) in enumerate(fams.wgt_units):
         both = f"{_q(w)} IS NOT NULL" if x is None else f"{_q(x)} IS NOT NULL AND {_q(w)} IS NOT NULL"
         num = "CAST(0.0 AS DOUBLE)" if x is None \
@@ -201,10 +234,10 @@ def fold_delta(zset: DataFrame, by, fams: _Families) -> DataFrame:
         exprs.append(f"bool_or({d} < 0) AS _a_ret")
     pass1 = zset.groupBy(*by_cols).agg(*[F.expr(e) for e in exprs])
 
-    if not fams.add_cols:
+    if not fams.add_cols and not fams.co_pairs:
         return pass1
-    # Second pass: each partition's central moment about its own mean (deviations are O(spread), not
-    # O(value) — the well-conditioned form). Joined back onto pass1.
+    # Second pass: each partition's central (co-)moments about its own mean(s) (deviations are
+    # O(spread), not O(value) — the well-conditioned form). Joined back onto pass1.
     joined = zset.join(pass1, on=list(by), how="inner")
     mexprs = []
     for i, c in enumerate(fams.add_cols):
@@ -214,6 +247,22 @@ def fold_delta(zset: DataFrame, by, fams: _Families) -> DataFrame:
             f"THEN {d} * pow({_q(c)} - _dsi_{i} / _dni_{i}, 2) END), 0.0) AS DOUBLE) AS _dm2i_{i}",
             f"CAST(coalesce(sum(CASE WHEN {d} < 0 AND {nn} AND _dnd_{i} > 0 "
             f"THEN -{d} * pow({_q(c)} - _dsd_{i} / _dnd_{i}, 2) END), 0.0) AS DOUBLE) AS _dm2d_{i}",
+        ]
+    for k, (x, y) in enumerate(fams.co_pairs):
+        xq, yq = _q(x), _q(y)
+        pr = f"{xq} IS NOT NULL AND {yq} IS NOT NULL"
+        mxi, myi = f"_csxi_{k} / _cni_{k}", f"_csyi_{k} / _cni_{k}"
+        mxd, myd = f"_csxd_{k} / _cnd_{k}", f"_csyd_{k} / _cnd_{k}"
+        ins, dele = f"{d} > 0 AND {pr} AND _cni_{k} > 0", f"{d} < 0 AND {pr} AND _cnd_{k} > 0"
+        mexprs += [
+            f"CAST(coalesce(sum(CASE WHEN {ins} THEN {d} * pow({xq} - {mxi}, 2) END), 0.0) AS DOUBLE) AS _cm2xi_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {ins} THEN {d} * pow({yq} - {myi}, 2) END), 0.0) AS DOUBLE) AS _cm2yi_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {ins} THEN {d} * ({xq} - {mxi}) * ({yq} - {myi}) END), 0.0) AS DOUBLE)"
+            f" AS _ccxyi_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {dele} THEN -{d} * pow({xq} - {mxd}, 2) END), 0.0) AS DOUBLE) AS _cm2xd_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {dele} THEN -{d} * pow({yq} - {myd}, 2) END), 0.0) AS DOUBLE) AS _cm2yd_{k}",
+            f"CAST(coalesce(sum(CASE WHEN {dele} THEN -{d} * ({xq} - {mxd}) * ({yq} - {myd}) END), 0.0) AS DOUBLE)"
+            f" AS _ccxyd_{k}",
         ]
     pass2 = joined.groupBy(*by_cols).agg(*[F.expr(e) for e in mexprs])
     return pass1.join(pass2, on=list(by), how="left")
@@ -230,6 +279,30 @@ def rescan_groups(current: DataFrame, ret_groups: DataFrame, by, fams: _Families
         exprs += [f"{_SG_FN[kind]}({_q(c)}) AS _r_val_{g}"]
     scoped = current.join(F.broadcast(ret_groups), on=list(by), how="leftsemi")
     return scoped.groupBy(*[F.col(_q(b)) for b in by]).agg(*[F.expr(e) for e in exprs])
+
+
+def _co2_merge(nA, sA1, sA2, mA, ni, si1, si2, mi, nd, sd1, sd2, md, *, clamp: bool) -> str:
+    """The merged second-order (co-)moment by the parallel form ``M = MA + MB + δ1·δ2·nA·nB/n`` and its
+    inverse — merge in the insert partition, then merge out the delete partition. With the two
+    coordinates equal this is a variance ``M2`` (``clamp`` to ≥0); with distinct coordinates it is the
+    covariance ``Cxy`` (no clamp — it may be negative). The δ terms are differences of partition means,
+    so the form is well-conditioned at any value magnitude."""
+    nC = f"({nA} + {ni})"
+    mC = (
+        f"{mA} + CASE WHEN {ni} > 0 THEN {mi} ELSE 0.0 END"
+        f" + CASE WHEN {nA} > 0 AND {ni} > 0"
+        f" THEN ({si1} / {ni} - {sA1} / {nA}) * ({si2} / {ni} - {sA2} / {nA})"
+        f" * CAST({nA} AS DOUBLE) * {ni} / {nC} ELSE 0.0 END"
+    )
+    nNew = f"({nC} - {nd})"
+    sN1, sN2 = f"({sA1} + {si1} - {sd1})", f"({sA2} + {si2} - {sd2})"
+    mNew = (
+        f"({mC}) - CASE WHEN {nd} > 0 THEN {md} ELSE 0.0 END"
+        f" - CASE WHEN {nd} > 0 AND {nNew} > 0"
+        f" THEN ({sd1} / {nd} - {sN1} / {nNew}) * ({sd2} / {nd} - {sN2} / {nNew})"
+        f" * CAST({nNew} AS DOUBLE) * {nd} / {nC} ELSE 0.0 END"
+    )
+    return f"greatest({mNew}, 0.0)" if clamp else f"({mNew})"
 
 
 def merge_rows(state: DataFrame, dacc: DataFrame, rescan: DataFrame | None, by, fams: _Families) -> DataFrame:
@@ -268,6 +341,25 @@ def merge_rows(state: DataFrame, dacc: DataFrame, rescan: DataFrame | None, by, 
             f"CASE WHEN {ret} THEN {r(f'_r_min_{j}')} ELSE least(a._a_min_{j}, d._e_minp_{j}) END AS _a_min_{j}",
             f"CASE WHEN {ret} THEN {r(f'_r_max_{j}')} ELSE greatest(a._a_max_{j}, d._e_maxp_{j}) END AS _a_max_{j}",
         ]
+    for k in range(len(fams.co_pairs)):
+        nA = f"coalesce(a._c_n_{k}, 0)"
+        sxA, syA = f"coalesce(a._c_sx_{k}, 0.0)", f"coalesce(a._c_sy_{k}, 0.0)"
+        m2xA, m2yA, cxyA = f"coalesce(a._c_m2x_{k}, 0.0)", f"coalesce(a._c_m2y_{k}, 0.0)", f"coalesce(a._c_cxy_{k}, 0.0)"
+        ni, nd = f"d._cni_{k}", f"d._cnd_{k}"
+        sxi, syi, sxd, syd = f"d._csxi_{k}", f"d._csyi_{k}", f"d._csxd_{k}", f"d._csyd_{k}"
+        m2xi, m2yi, cxyi = f"coalesce(d._cm2xi_{k}, 0.0)", f"coalesce(d._cm2yi_{k}, 0.0)", f"coalesce(d._ccxyi_{k}, 0.0)"
+        m2xd, m2yd, cxyd = f"coalesce(d._cm2xd_{k}, 0.0)", f"coalesce(d._cm2yd_{k}, 0.0)", f"coalesce(d._ccxyd_{k}, 0.0)"
+        sel += [
+            f"CAST({nA} + {ni} - {nd} AS BIGINT) AS _c_n_{k}",
+            f"CAST({sxA} + {sxi} - {sxd} AS DOUBLE) AS _c_sx_{k}",
+            f"CAST({syA} + {syi} - {syd} AS DOUBLE) AS _c_sy_{k}",
+            f"CAST({_co2_merge(nA, sxA, sxA, m2xA, ni, sxi, sxi, m2xi, nd, sxd, sxd, m2xd, clamp=True)}"
+            f" AS DOUBLE) AS _c_m2x_{k}",
+            f"CAST({_co2_merge(nA, syA, syA, m2yA, ni, syi, syi, m2yi, nd, syd, syd, m2yd, clamp=True)}"
+            f" AS DOUBLE) AS _c_m2y_{k}",
+            f"CAST({_co2_merge(nA, sxA, syA, cxyA, ni, sxi, syi, cxyi, nd, sxd, syd, cxyd, clamp=False)}"
+            f" AS DOUBLE) AS _c_cxy_{k}",
+        ]
     for m in range(len(fams.wgt_units)):
         sel += [
             f"CAST(coalesce(a._w_num_{m}, 0.0) + d._dw_num_{m} AS DOUBLE) AS _w_num_{m}",
@@ -304,6 +396,7 @@ def derive(state: DataFrame, by, metrics, fams: _Families) -> DataFrame:
     """The published user columns from the accumulators (groups with rows only)."""
     sidx = {c: i for i, c in enumerate(fams.add_cols)}
     eidx = {c: j for j, c in enumerate(fams.ext_cols)}
+    cidx = {pair: k for k, pair in enumerate(fams.co_pairs)}
     widx = {u: m for m, u in enumerate(fams.wgt_units)}
     aidx = {s: a for a, s in enumerate(fams.arg_specs)}
     gidx = {s: g for g, s in enumerate(fams.sg_specs)}
@@ -327,6 +420,19 @@ def derive(state: DataFrame, by, metrics, fams: _Families) -> DataFrame:
                 e = f"sqrt({e})"
         elif m.kind in ("min", "max"):
             e = f"_a_{m.kind}_{eidx[m.col]}"
+        elif m.kind in _CO_KINDS:
+            k = cidx[(m.col, m.col2)]
+            n, cxy, m2x, m2y = f"_c_n_{k}", f"_c_cxy_{k}", f"_c_m2x_{k}", f"_c_m2y_{k}"
+            if m.kind == "covariance":
+                lo, denom = (2, f"({n} - 1)") if m.how == "sample" else (1, n)
+                e = f"CASE WHEN {n} >= {lo} THEN {cxy} / {denom} END"
+            elif m.kind == "pearson_correlation":
+                e = f"CASE WHEN {n} >= 2 AND {m2x} > 0 AND {m2y} > 0 THEN {cxy} / sqrt({m2x} * {m2y}) END"
+            elif m.kind == "ols_slope":
+                e = f"CASE WHEN {m2x} > 0 THEN {cxy} / {m2x} END"
+            else:  # ols_intercept = ȳ − slope·x̄
+                e = (f"CASE WHEN {n} >= 1 AND {m2x} > 0 "
+                     f"THEN _c_sy_{k} / {n} - ({cxy} / {m2x}) * (_c_sx_{k} / {n}) END")
         elif m.kind == "weight_total":
             mm = widx[(None, m.col)]
             e = f"CASE WHEN _w_cnt_{mm} > 0 THEN _w_den_{mm} END"

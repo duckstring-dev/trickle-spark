@@ -141,13 +141,37 @@ def test_comprehensive_matches_incremental(spark, db):
     assert rows_of(spark, out_a) == rows_of(spark, out_b)
 
 
+def test_ungrouped_scan_folds_the_whole_table(spark, db):
+    events(spark, db)
+    out = f"{db}.scored"
+    # no by= — one fold over the whole table; event_id is the globally monotonic axis
+    plan = (ts.source(f"{db}.events", p=1.0)
+            .along("event_id")
+            .accumulate(run_total=acc.sum("x"), seen=acc.count()))
+    res = plan.merge_into(spark, out, pk=("event_id",))
+    assert res.status == "bootstrap"
+    assert table_rows(spark, out, "event_id", "run_total", "seen") == [
+        (1, 10.0, 1), (2, 30.0, 2), (3, 35.0, 3)]
+
+    spark.sql(f"INSERT INTO {db}.events VALUES (4, 'g2', 3, 2.0)")  # a tail append resumes
+    res = plan.merge_into(spark, out, pk=("event_id",))
+    assert res.status == "incremental"
+    assert table_rows(spark, out, "event_id", "run_total", "seen") == [
+        (1, 10.0, 1), (2, 30.0, 2), (3, 35.0, 3), (4, 37.0, 4)]
+    assert {r.event_id for r in cdf_at(spark, out, latest_version(spark, out))} == {4}
+
+    spark.sql(f"DELETE FROM {db}.events WHERE event_id = 2")  # a past change re-folds everything after it
+    res = plan.merge_into(spark, out, pk=("event_id",))
+    assert res.status == "incremental"
+    assert table_rows(spark, out, "event_id", "run_total", "seen") == [
+        (1, 10.0, 1), (3, 15.0, 2), (4, 17.0, 3)]
+
+
 def test_accumulate_build_errors(spark, db):
     events(spark, db)
     src = ts.source(f"{db}.events")
     with pytest.raises(BuildError, match="order axis"):
         src.accumulate(by="grp", total=acc.sum("x"))
-    with pytest.raises(BuildError, match="group key"):
-        ts.source(f"{db}.events").along("t").accumulate(total=acc.sum("x"))
     with pytest.raises(BuildError, match="acc\\.\\*"):
         ts.source(f"{db}.events").along("t").accumulate(by="grp", total="sum(x)")
     with pytest.raises(BuildError, match="follow"):

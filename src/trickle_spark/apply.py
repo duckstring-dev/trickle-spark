@@ -35,9 +35,7 @@ def apply_zset(spark: SparkSession, output: str, zset: DataFrame, pk: tuple[str,
     z = consolidate(zset)
     check_no_system_columns(z, context=f"apply to {output}")
     if not z.take(1):
-        beat = hashlib.sha256(metadata_json.encode()).hexdigest()[:16]
-        with commit_metadata(spark, metadata_json):
-            spark.sql(f"ALTER TABLE {q(output)} SET TBLPROPERTIES ('{SYSTEM_PREFIX}heartbeat' = '{beat}')")
+        heartbeat(spark, output, metadata_json)
         return "empty"
 
     upserts = z.where(F.col(D_COL) > 0).drop(D_COL).withColumn(OP_COL, F.lit("U"))
@@ -62,6 +60,15 @@ def apply_zset(spark: SparkSession, output: str, zset: DataFrame, pk: tuple[str,
     with commit_metadata(spark, metadata_json):
         merge.execute()
     return "merged"
+
+
+def heartbeat(spark: SparkSession, output: str, metadata_json: str) -> None:
+    """The watermark-advance for a run that changed no data: Delta elides data-less writes, so the
+    vehicle is a metadata-only ``SET TBLPROPERTIES`` commit carrying the userMetadata. It emits no CDF
+    rows — downstream windows consolidate to empty and cascade skips, not work."""
+    beat = hashlib.sha256(metadata_json.encode()).hexdigest()[:16]
+    with commit_metadata(spark, metadata_json):
+        spark.sql(f"ALTER TABLE {q(output)} SET TBLPROPERTIES ('{SYSTEM_PREFIX}heartbeat' = '{beat}')")
 
 
 def write_bootstrap(spark: SparkSession, output: str, df: DataFrame, metadata_json: str) -> None:

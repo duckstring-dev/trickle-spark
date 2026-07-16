@@ -375,7 +375,8 @@ class Builder:
 
     # ─── terminals ──────────────────────────────────────────────────────────────
 
-    def merge_into(self, spark, output: str, *, pk=None, ivm: bool = True, key_filter: bool = True) -> RunResult:
+    def merge_into(self, spark, output: str, *, pk=None, ivm: bool = True, key_filter: bool = True,
+                   tag: str | None = None) -> RunResult:
         """Run one maintenance step of this plan into the Delta table ``output`` (see
         :func:`materialize`). ``pk`` is the output identity (must be genuinely unique; after
         :meth:`aggregate` it defaults to the group key).
@@ -383,7 +384,7 @@ class Builder:
         ``ivm=False`` ignores deltas and recomputes comprehensively (diffed against the current output);
         ``key_filter=False`` keeps the delta composition but skips the ``key ∈ K`` pre-filter — manual
         escapes, measure before reaching for them."""
-        return materialize(spark, output, self, pk=pk, ivm=ivm, key_filter=key_filter)
+        return materialize(spark, output, self, pk=pk, ivm=ivm, key_filter=key_filter, tag=tag)
 
     def append_to(
         self,
@@ -395,6 +396,7 @@ class Builder:
         log_drops: bool = True,
         ivm: bool = True,
         key_filter: bool = True,
+        tag: str | None = None,
     ) -> RunResult:
         """Run one maintenance step of this plan into the **append-only** Delta table ``output`` — for
         a *monotonic* transform whose output rows are only ever added, never updated or retracted
@@ -411,7 +413,7 @@ class Builder:
         and past-changes are impossible by construction. See ``append.py``."""
         return materialize_append(
             spark, output, self, pk=pk, fail_on_conflict=fail_on_conflict, log_drops=log_drops,
-            ivm=ivm, key_filter=key_filter,
+            ivm=ivm, key_filter=key_filter, tag=tag,
         )
 
     def schema(self, spark) -> dict[str, str]:
@@ -437,6 +439,7 @@ def materialize(
     pk,
     ivm: bool = True,
     key_filter: bool = True,
+    tag: str | None = None,
 ) -> RunResult:
     """One incremental maintenance step: compile ``plan`` against pinned reads and land one commit on
     ``output`` via :func:`~.run.run` (which owns watermarks, skip/bootstrap/fallback, and the apply)."""
@@ -461,6 +464,7 @@ def materialize(
             p=p_map,
             compiler_factory=lambda ctx: _Compiler(ctx, plan, key_filter=key_filter),
             ivm=ivm and plan._sql_query is None,
+            tag=tag,
         )
 
     if plan._agg is not None:
@@ -472,6 +476,7 @@ def materialize(
             p=p_map,
             compiler_factory=lambda ctx: _Compiler(ctx, plan, key_filter=key_filter),
             ivm=ivm and plan._sql_query is None,
+            tag=tag,
         )
         if any(m.kind == "reduce" for m in plan._agg["metrics"].values()):
             from .accumulate import run_reduce
@@ -498,7 +503,7 @@ def materialize(
             _require_pk(out_pk, [c for c in zset.columns if c != D_COL], output)
         return zset
 
-    return run(spark, output, sources=sources, pk=out_pk, full=full, delta=delta, p=p_map)
+    return run(spark, output, sources=sources, pk=out_pk, full=full, delta=delta, p=p_map, tag=tag)
 
 
 def materialize_append(
@@ -511,6 +516,7 @@ def materialize_append(
     log_drops: bool = True,
     ivm: bool = True,
     key_filter: bool = True,
+    tag: str | None = None,
 ) -> RunResult:
     """One maintenance step landing on an **append-only** output (see :meth:`Builder.append_to`).
     The plan composes exactly as for :func:`materialize`; only the apply differs — a comprehensive
@@ -546,7 +552,7 @@ def materialize_append(
 
     return run_append(
         spark, output, sources=sources, pk=out_pk, full=full, delta=delta, p=p_map,
-        fail_on_conflict=fail_on_conflict, log_drops=log_drops,
+        fail_on_conflict=fail_on_conflict, log_drops=log_drops, tag=tag,
     )
 
 

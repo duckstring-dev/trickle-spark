@@ -497,6 +497,7 @@ def run_aggregate(
     p,
     compiler_factory,
     ivm: bool = True,
+    tag: str | None = None,
 ) -> RunResult:
     """One maintenance step of an aggregate plan. ``compiler_factory(ctx)`` yields the plan compiler
     (``.current()`` = the composed input rows, ``.delta()`` = the input ΔO); everything else — the
@@ -554,4 +555,4 @@ def run_aggregate(
             .unionByName(old_out.withColumn(D_COL, F.lit(-1).cast("long")))
         )
 
-    return run(spark, output, sources=sources, pk=pk, full=full, delta=delta, p=p)
+    return run(spark, output, sources=sources, pk=pk, full=full, delta=delta, p=p, tag=tag)

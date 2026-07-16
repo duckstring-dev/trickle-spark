@@ -231,6 +231,7 @@ def run_accumulate(
     p,
     compiler_factory,
     ivm: bool = True,
+    tag: str | None = None,
 ) -> RunResult:
     """One maintenance step of an accumulate plan (see the module docstring for the tail/past split)."""
     metric_list = list(metrics.items())
@@ -354,7 +355,7 @@ def run_accumulate(
             return new_out.unionByName(old.withColumn(D_COL, F.lit(-1).cast("long")))
         return new_out
 
-    return run(spark, output, sources=sources, pk=pk, full=full, delta=delta, p=p)
+    return run(spark, output, sources=sources, pk=pk, full=full, delta=delta, p=p, tag=tag)
 
 
 # ─── the ordered reduce (agg.reduce via .along().aggregate()) ────────────────────
@@ -372,6 +373,7 @@ def run_reduce(
     p,
     compiler_factory,
     ivm: bool = True,
+    tag: str | None = None,
 ) -> RunResult:
     """One maintenance step of an ordered-reduce plan: the accumulate fold **collapsed to one value per
     group** — each ``agg.reduce(fn, init)`` folds its group's rows in ``.along`` order and keeps only
@@ -494,4 +496,4 @@ def run_reduce(
         old = spark.table(output).join(F.broadcast(akdf), on=list(by), how="leftsemi")
         return new_out.unionByName(old.withColumn(D_COL, F.lit(-1).cast("long")))
 
-    return run(spark, output, sources=sources, pk=pk, full=full, delta=delta, p=p)
+    return run(spark, output, sources=sources, pk=pk, full=full, delta=delta, p=p, tag=tag)

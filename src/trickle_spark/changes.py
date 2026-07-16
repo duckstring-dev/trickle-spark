@@ -16,7 +16,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.utils import AnalysisException
 
-from .tables import Pin, read_as_of
+from .tables import Pin, read_as_of, tagged_versions
 from .zset import D_COL, Delta, as_zset, consolidate
 
 _CDF_COLS = ("_change_type", "_commit_version", "_commit_timestamp")
@@ -37,6 +37,23 @@ def _cdf_window(spark: SparkSession, source: str, lo: int, hi: int) -> DataFrame
     )
     _ = df.schema  # force analysis so retention/CDF-availability errors surface here, not at first action
     return df
+
+
+def changes_at_tag(spark: SparkSession, table: str, tag: str) -> Delta:
+    """The consolidated Z-set the run(s) stamped ``tag`` applied to ``table`` — **content-addressed**
+    by the tag, so no consumer-side watermark is needed anywhere: a caller that tags each run with its
+    own epoch (``merge_into(..., tag=f)``) recovers exactly that epoch's change on demand, and a
+    replay recovers the identical window. Empty (never ``is_full``) when no commit carries the tag
+    (the run skipped) or the tagged commit was a heartbeat."""
+    versions = tagged_versions(spark, table, tag)
+    if not versions:
+        return Delta(zset=as_zset(spark.table(table)).limit(0), is_full=False)
+    cdf = _cdf_window(spark, table, versions[0], versions[-1])
+    cdf = cdf.where(F.col("_commit_version").isin(versions))  # untagged commits in the range don't count
+    zset = consolidate(
+        cdf.withColumn(D_COL, F.when(F.col("_change_type").isin(*_POSITIVE), 1).otherwise(-1).cast("long")).drop(*_CDF_COLS)
+    )
+    return Delta(zset=zset, is_full=False)
 
 
 def delta_of(spark: SparkSession, source: str, pin: Pin, last: Pin | None, *, p: float | None = None) -> Delta:

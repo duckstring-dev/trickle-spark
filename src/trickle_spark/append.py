@@ -41,8 +41,8 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from .apply import heartbeat, write_bootstrap
-from .run import RunContext, RunResult
-from .tables import Pin, commit_metadata, commit_metadata_json, pin_table, read_watermarks, table_exists
+from .run import RunContext, RunResult, pin_of
+from .tables import Pin, commit_metadata, commit_metadata_json, read_watermarks, table_exists
 from .zset import D_COL, as_zset, check_no_system_columns, consolidate
 
 DROPLOG_SUFFIX = "__trickle_droplog"
@@ -68,6 +68,7 @@ def run_append(
     p: float | dict[str, float] | None = None,
     fail_on_conflict: bool = True,
     log_drops: bool = True,
+    tag: str | None = None,
 ) -> RunResult:
     """One maintenance step for an **append-only** ``output`` — :func:`~.run.run`'s sibling with the
     same planning ladder (skip / bootstrap / incremental / comprehensive, one watermark-carrying commit)
@@ -79,7 +80,7 @@ def run_append(
 
     exists = table_exists(spark, output)
     last = read_watermarks(spark, output) if exists else None
-    pins = {s: pin_table(spark, s) for s in sources}
+    pins = {s: pin_of(spark, s) for s in sources}
 
     if exists and last is not None and all(last.get(s) == pins[s] for s in sources):
         return RunResult(status="skipped", pins=pins, changed=False)
@@ -89,7 +90,7 @@ def run_append(
     if not exists:
         appended = _apply_append(
             spark, output, as_zset(full(ctx), 1), pk, "bootstrap", pins,
-            fail_on_conflict=fail_on_conflict, log_drops=log_drops, bootstrap=True,
+            fail_on_conflict=fail_on_conflict, log_drops=log_drops, bootstrap=True, tag=tag,
         )
         return RunResult(status="bootstrap", pins=pins, changed=appended)
 
@@ -102,7 +103,7 @@ def run_append(
         zset = as_zset(full(ctx), 1)
     appended = _apply_append(
         spark, output, zset, pk, status, pins,
-        fail_on_conflict=fail_on_conflict, log_drops=log_drops, bootstrap=False,
+        fail_on_conflict=fail_on_conflict, log_drops=log_drops, bootstrap=False, tag=tag,
     )
     return RunResult(status=status, pins=pins, changed=appended)
 
@@ -118,6 +119,7 @@ def _apply_append(
     fail_on_conflict: bool,
     log_drops: bool,
     bootstrap: bool,
+    tag: str | None = None,
 ) -> bool:
     """Consolidate, vet the conflicts, and land the new rows as one append commit (or the heartbeat).
     Returns whether any genuinely new rows were appended (benign skips and dropped conflicts don't
@@ -129,7 +131,7 @@ def _apply_append(
         missing = [c for c in pk if c not in user]
         if missing:
             raise ValueError(f"append to '{output}': primary key column(s) {missing} not in the composed output")
-    metadata_json = commit_metadata_json(kind, pins)
+    metadata_json = commit_metadata_json(kind, pins, tag=tag)
     plus = z.where(F.col(D_COL) > 0).drop(D_COL)
     retractions = z.where(F.col(D_COL) < 0).drop(D_COL)
 

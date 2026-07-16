@@ -103,6 +103,29 @@ def _latest_payload(spark: SparkSession, output: str) -> dict | None:
         return None
 
 
+def tagged_versions(spark: SparkSession, table: str, tag: str) -> list[int]:
+    """Every commit version of ``table`` whose trickle metadata carries exactly this ``tag`` — the
+    lookup behind :func:`~.changes.changes_at_tag` (a run's change, content-addressed by its tag)."""
+    if not table_exists(spark, table):
+        return []
+    hist = (
+        DeltaTable.forName(spark, table)
+        .history()
+        .select("version", "userMetadata")
+        .where(f"userMetadata LIKE '%{METADATA_KEY}%'")
+        .collect()
+    )
+    out = []
+    for row in hist:
+        try:
+            payload = json.loads(row.userMetadata)[METADATA_KEY]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if payload.get("tag") == tag:
+            out.append(int(row.version))
+    return sorted(out)
+
+
 def read_tag(spark: SparkSession, table: str) -> str | None:
     """The opaque ``tag`` of ``table``'s latest trickle-stamped commit (see
     :func:`commit_metadata_json`) — the replay guard for :func:`~.bridge.apply_changes`: a caller

@@ -61,6 +61,30 @@ def test_apply_changes_duplicate_landing_key_raises(spark, db):
         ts.apply_changes(spark, f"{db}.landed", zset(spark, [(1, "a"), (1, "b")]), pk=("id",))
 
 
+def test_changes_at_tag_recovers_each_runs_change(spark, db):
+    src, out = f"{db}.src", f"{db}.out"
+    make_source(spark, src, [(1, "a"), (2, "b")])
+    plan = ts.source(src, p=1.0)
+    plan.merge_into(spark, out, pk=("id",), tag="f1")
+
+    spark.sql(f"UPDATE {src} SET v = 'B' WHERE id = 2")
+    plan.merge_into(spark, out, pk=("id",), tag="f2")
+
+    # each epoch's change is recoverable independently, content-addressed by its tag
+    d1 = ts.changes_at_tag(spark, out, "f1")
+    assert sorted((r.id, r[D_COL]) for r in d1.zset.collect()) == [(1, 1), (2, 1)]
+    d2 = ts.changes_at_tag(spark, out, "f2")
+    assert sorted((r.id, r.v, r[D_COL]) for r in d2.zset.collect()) == [(2, "B", 1), (2, "b", -1)]
+
+    # a replay skips the run, but the tagged window is still there — exactly-once emit for free
+    assert plan.merge_into(spark, out, pk=("id",), tag="f2").status == "skipped"
+    again = ts.changes_at_tag(spark, out, "f2")
+    assert sorted((r.id, r.v, r[D_COL]) for r in again.zset.collect()) == [(2, "B", 1), (2, "b", -1)]
+
+    # an unknown tag (the run never committed) is an empty window, not an error
+    assert ts.changes_at_tag(spark, out, "f9").is_empty()
+
+
 def test_table_changes_windows_by_the_callers_pin(spark, db):
     src = f"{db}.src"
     make_source(spark, src, [(1, "a"), (2, "b")])

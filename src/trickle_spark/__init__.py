@@ -13,7 +13,8 @@ from . import (
 from .append import AppendConflict, run_append
 from .bridge import apply_changes, table_changes
 from .builder import Builder, BuildError, materialize, materialize_append, source
-from .changes import delta_of
+from .changes import changes_at_tag, delta_of
+from .duckstring import duckstring_source
 from .run import RunContext, RunResult, run
 from .tables import Pin, pin_table, read_tag, read_watermarks
 from .zset import D_COL, SYSTEM_PREFIX, Delta, as_zset, consolidate, diff
@@ -30,9 +31,11 @@ __all__ = [
     "RunResult",
     "apply_changes",
     "as_zset",
+    "changes_at_tag",
     "consolidate",
     "delta_of",
     "diff",
+    "duckstring_source",
     "materialize",
     "materialize_append",
     "pin_table",

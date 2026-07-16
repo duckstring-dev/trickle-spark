@@ -13,10 +13,18 @@ from typing import Callable
 
 from pyspark.sql import DataFrame, SparkSession
 
+from . import duckstring as _dk
 from .apply import apply_zset, current, write_bootstrap
 from .changes import delta_of
 from .tables import Pin, commit_metadata_json, pin_table, read_watermarks, table_exists
 from .zset import Delta, diff
+
+
+def pin_of(spark: SparkSession, source: str) -> Pin:
+    """Pin a source for this run — a Delta table's version, or a duckstring source's published epoch."""
+    if _dk.is_duckstring_ref(source):
+        return _dk.pin_source(source)
+    return pin_table(spark, source)
 
 
 @dataclass
@@ -38,11 +46,18 @@ class RunContext:
     _deltas: dict[str, Delta] = field(default_factory=dict)
 
     def new(self, source: str) -> DataFrame:
+        if _dk.is_duckstring_ref(source):
+            return _dk.current_state(self.spark, source, self.pins[source])
         from .tables import read_as_of
 
         return read_as_of(self.spark, source, self.pins[source].version)
 
     def old(self, source: str) -> DataFrame:
+        if _dk.is_duckstring_ref(source):
+            d = self.delta(source)
+            if d.is_full:
+                raise ValueError(f"{source}: no usable watermark — there is no old state (check Delta.is_full first)")
+            return _dk.rewind(self.new(source), d.zset)  # current ⊎ (−δ): no time travel needed
         from .tables import read_as_of
 
         entry = (self.last or {}).get(source)
@@ -52,9 +67,14 @@ class RunContext:
 
     def delta(self, source: str) -> Delta:
         if source not in self._deltas:
-            self._deltas[source] = delta_of(
-                self.spark, source, self.pins[source], (self.last or {}).get(source), p=self.p.get(source)
-            )
+            if _dk.is_duckstring_ref(source):
+                self._deltas[source] = _dk.delta_of_ref(
+                    self.spark, source, self.pins[source], (self.last or {}).get(source), p=self.p.get(source)
+                )
+            else:
+                self._deltas[source] = delta_of(
+                    self.spark, source, self.pins[source], (self.last or {}).get(source), p=self.p.get(source)
+                )
         return self._deltas[source]
 
 
@@ -74,6 +94,7 @@ def run(
     full: Callable[[RunContext], DataFrame],
     delta: Callable[[RunContext], DataFrame | None] | None = None,
     p: float | dict[str, float] | None = None,
+    tag: str | None = None,
 ) -> RunResult:
     """One maintenance step for ``output``.
 
@@ -89,6 +110,9 @@ def run(
     (recompute, then *diff against the current output* and MERGE only real changes, so downstream
     windows stay honest); otherwise → **incremental** (apply ``delta``'s Z-set). Every non-skip path
     lands exactly one commit carrying the pinned watermarks.
+
+    ``tag`` stamps the run's commit with an opaque caller token (e.g. a Duckstring run's epoch ``f``)
+    — :func:`~.changes.changes_at_tag` can then recover exactly this run's change, content-addressed.
     """
     if not sources:
         raise ValueError("run() needs at least one source")
@@ -96,7 +120,7 @@ def run(
 
     exists = table_exists(spark, output)
     last = read_watermarks(spark, output) if exists else None
-    pins = {s: pin_table(spark, s) for s in sources}
+    pins = {s: pin_of(spark, s) for s in sources}
 
     if exists and last is not None and all(last.get(s) == pins[s] for s in sources):
         return RunResult(status="skipped", pins=pins, changed=False)
@@ -104,7 +128,7 @@ def run(
     ctx = RunContext(spark=spark, pins=pins, last=last, p=p_map)
 
     if not exists:
-        write_bootstrap(spark, output, full(ctx), commit_metadata_json("bootstrap", pins))
+        write_bootstrap(spark, output, full(ctx), commit_metadata_json("bootstrap", pins, tag=tag))
         return RunResult(status="bootstrap", pins=pins)
 
     zset = None
@@ -114,5 +138,5 @@ def run(
         status = "incremental" if zset is not None else "comprehensive"
     if zset is None:
         zset = diff(full(ctx), current(spark, output))
-    action = apply_zset(spark, output, zset, pk, commit_metadata_json(status, pins))
+    action = apply_zset(spark, output, zset, pk, commit_metadata_json(status, pins, tag=tag))
     return RunResult(status=status, pins=pins, changed=action == "merged")

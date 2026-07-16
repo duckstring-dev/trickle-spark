@@ -143,24 +143,33 @@ ts.run(spark, "shop.clean_orders", sources=["shop.orders"], pk=("order_id",), fu
 `ctx.delta(src)` is a consolidated Z-set (`_trickle_d` = +1/−1, full row images); `ctx.new`/`ctx.old`
 are the pinned current and watermark states.
 
-### Bridging to another incremental engine
+### Duckstring interop (native)
 
-The Z-set is the lingua franca, so crossing into or out of a sibling engine (say, a
-[Duckstring](https://github.com/duckstring-dev/duckstring) Trickle pipeline where one stage needs
-multinode compute) takes two primitives, both in `trickle_spark.bridge`:
+A [Duckstring](https://github.com/duckstring-dev/duckstring) Pond's published output — per-run
+parquet parts stamped `_duckstring_f`, plus the `_trickle.json` sidecar — is already an interchange
+format, and trickle-spark reads it **natively**: no landing tables, no duckdb dependency, nothing
+added to duckstring. For the pipeline that's 90% DuckDB-sized with one join that isn't:
 
 ```python
-# inbound: land a foreign Z-set window on a Delta table — CDF re-derives the changelog from there,
-# so downstream plans are fully native. `tag` (the producer's epoch) makes replays exactly-once.
-ts.apply_changes(spark, "bridge.orders", zset, pk=("order_id",), tag=str(f))
+plan = (ts.duckstring_source(pond_data_dir, "orders").alias("o")
+        .join(ts.duckstring_source(pond_data_dir, "catalog").alias("c"), on="product_id")
+        .mutate(amount="o.qty * c.price"))
+plan.merge_into(spark, "bridge.priced", pk=("order_id",), tag=str(pond_f))   # stamp the Pond epoch
 
-# outbound: the output's consolidated change since a pin the *consumer* remembers, plus the next pin
-delta, pin = ts.table_changes(spark, "bridge.priced", last_pin)
+delta = ts.changes_at_tag(spark, "bridge.priced", str(pond_f))               # hand it back at that epoch
 ```
 
-Neither engine learns the other's clock — each windows by its own axis, and the crossing carries full
-row images. A worked Duckstring↔Spark round trip (landing ripples, epoch-keyed pin bookkeeping,
-replay idempotence on both sides) is `tests/test_duckstring_bridge.py`.
+Each source windows by its own axis (duckstring's epoch `f` rides the Spark output's commit metadata
+like any Delta pin), coverage mirrors duckstring's own consumer rules (a refreshed Pond's raised
+`floor` → a full read, never a wrong window), and the return path is **content-addressed by the
+tag** — a duckstring crash-replay at the same `f` skips the Spark run and recovers the identical
+window, with no bookkeeping table anywhere. The full round trip is `tests/test_duckstring_bridge.py`;
+the format expectation (duckstring ≥ 0.4's published layout) is documented in
+`trickle_spark/duckstring.py`.
+
+For *other* producers, the engine-neutral pair in `trickle_spark.bridge` still applies:
+`apply_changes` lands a foreign Z-set on a CDF-enabled table (tag-idempotent), and `table_changes`
+reads a table's consolidated window since a pin the consumer remembers.
 
 ## The deployment pattern ("a pond, demoted to a pattern")
 
@@ -205,11 +214,12 @@ The reference implementation and behavioural oracle is duckstring's `trickle/` p
 covers the core io, the full join DAG (all six `how`s, bushy shapes, the affected-key recompute with
 a broadcast null-safe key pre-filter), aggregation — including the two-variable co-moments and the
 order-dependent `agg.reduce` — ordered scans (grouped and ungrouped), and the `.append_to` terminal
-with droplog conflict semantics. The reserved "explicit-changelog change source" resolved into the
-**bridge pair** (`apply_changes`/`table_changes`) once the cross-system use case arrived: landing a
-foreign Z-set and letting CDF re-derive the changelog covers it without reconstruction-based read
-machinery in the engine. Remaining follow-ups are the reference's own deferred set (skewness,
-holistic aggregates / `DISTINCT`), which stay a downstream `.sql()` step here as there.
+with droplog conflict semantics. The reserved "explicit-changelog change source" landed as
+`duckstring_source` — a foreign-changelog backend reading Duckstring's published parquet directly,
+windowed by its epoch — plus the tag-addressed return path (`changes_at_tag`) and the engine-neutral
+bridge pair (`apply_changes`/`table_changes`) for other producers. Remaining follow-ups are the
+reference's own deferred set (skewness, holistic aggregates / `DISTINCT`), which stay a downstream
+`.sql()` step here as there.
 
 ## Development
 

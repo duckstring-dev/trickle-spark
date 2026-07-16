@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trickle-spark"
+version = "0.1.0"
+description = "DBSP-style incremental data transforms on Spark + Delta Lake: Z-sets, changed-key joins, and watermarks that manage themselves."
+readme = "README.md"
+# <3.13: pyspark 3.5 (pinned below) imports distutils at its pandas seam — removed in Python 3.13.
+requires-python = ">=3.10,<3.13"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Duckstring", email = "dev@duckstring.com" }
+]
+dependencies = [
+  # <3.5.6: Spark 3.5.6+ regressed DataSourceV2 overwrite against delta 3.3.x ("Table ... does not
+  # support truncate in batch mode", delta-io/delta#4671); 3.5.5 is the last pairing that works with
+  # delta-spark 3.3.2 (the final Spark-3.5 Delta line). Revisit if a fixed delta 3.3.x ships.
+  "pyspark>=3.5,<3.5.6",
+  "delta-spark>=3.2,<4",
+  "pandas>=2.0",
+  "pyarrow>=10",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-timeout>=2.0",
+  "ruff>=0.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/duckstring-dev/trickle-spark"
+Repository = "https://github.com/duckstring-dev/trickle-spark"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Spark tests are slow (session startup, per-commit Delta log work) — hence the generous budget.
+timeout = 300
+
+[tool.ruff]
+line-length = 128
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]

@@ -27,15 +27,17 @@ identical window with no bookkeeping table anywhere.
 (part naming, the sidecar schema, the reconstruct rule) as of duckstring ≥ 0.4 — a read-only,
 documented contract, guarded by the round-trip test (``tests/test_duckstring_bridge.py``). It reads
 the flat layer both data-plane backends write (the Iceberg plane keeps flat sidecars for exactly this
-kind of consumer). ``data_dir`` must be a filesystem path both this process and Spark can reach (a
-shared/fuse mount for a remote cluster); object-store listing is not wired yet.
+kind of consumer). ``data_dir`` is a local path **or any URI Spark's Hadoop filesystems can reach**
+(``s3://`` — mapped to ``s3a://`` for the OSS connector — ``abfss://``, ``dbfs:/``, …): listing the
+parts and reading the sidecar go through Spark's own FileSystem API, so the same credentials that
+read the parquet do everything. Duckstring's credential query syntax on a storage URI
+(``?key_id=${env:…}``) is stripped, never resolved — authenticate the Spark side the Spark way.
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime
-from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -52,32 +54,89 @@ CHANGELOG_SUFFIX, WARM_SUFFIX, BASE_SUFFIX = "__changelog", "__band", "__base"
 
 def duckstring_source(data_dir, table: str, *, p: float = 0.3):
     """Start a plan at a Duckstring Pond's published ``table`` under ``data_dir`` (the Pond's data
-    directory holding ``_trickle.json``). Composes with Delta sources freely — each source windows by
-    its own axis. ``p`` is the usual change-fraction threshold."""
+    directory holding ``_trickle.json`` — a local path, or any object-store URI Spark's Hadoop
+    filesystems can reach: ``s3://``…, ``abfss://``…, ``dbfs:/``…). Composes with Delta sources
+    freely — each source windows by its own axis. ``p`` is the usual change-fraction threshold."""
     from .builder import Builder, _Source
 
     return Builder(_Source(ref_of(data_dir, table), p))
 
 
 def ref_of(data_dir, table: str) -> str:
-    return f"{REF_PREFIX}{Path(data_dir)}::{table}"
+    return f"{REF_PREFIX}{_spark_uri(str(data_dir))}::{table}"
 
 
 def is_duckstring_ref(ref) -> bool:
     return isinstance(ref, str) and ref.startswith(REF_PREFIX)
 
 
-def _parse(ref: str) -> tuple[Path, str]:
+def _parse(ref: str) -> tuple[str, str]:
     body = ref[len(REF_PREFIX):]
     data_dir, _, table = body.rpartition("::")
-    return Path(data_dir), table
+    return data_dir, table
 
 
-def _sidecar_entry(data_dir: Path, table: str) -> dict:
-    path = data_dir / SIDECAR
-    if not path.exists():
+def _spark_uri(location: str) -> str:
+    """Normalise a duckstring storage location for Hadoop-filesystem access: strip the credential
+    query (``?key_id=${env:…}&…`` is duckstring's own credential syntax — Spark's credential chain
+    authenticates, and the ``${env:}``/``${secret:}`` references are never resolved here) and map
+    ``s3://`` to ``s3a://`` (the OSS Hadoop connector's scheme; Databricks accepts either)."""
+    base, _, _query = location.partition("?")
+    base = base.rstrip("/")
+    if base.startswith("s3://"):
+        return "s3a://" + base[len("s3://"):]
+    return base
+
+
+# ─── storage access, through Spark's own Hadoop filesystems ──────────────────────
+#
+# Listing the parts and reading the sidecar go through the same FileSystem implementations (and the
+# same credentials) Spark uses to read the parquet moments later — one credential story, working
+# uniformly for local paths, S3, ABFS, and DBFS mounts. The round-trip test exercises this API over
+# the local filesystem; a MinIO-backed CI run is the object-store guard still to add.
+
+
+def _hadoop_fs(spark: SparkSession, uri: str):
+    jvm = spark.sparkContext._jvm
+    path = jvm.org.apache.hadoop.fs.Path(uri)
+    return path.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration()), path, jvm
+
+
+def _read_text(spark: SparkSession, uri: str) -> str | None:
+    fs, path, jvm = _hadoop_fs(spark, uri)
+    if not fs.exists(path):
+        return None
+    stream = fs.open(path)
+    try:
+        return bytes(jvm.org.apache.commons.io.IOUtils.toByteArray(stream)).decode("utf-8")
+    finally:
+        stream.close()
+
+
+def _list_parquet(spark: SparkSession, dir_uri: str) -> list[str]:
+    """The fully-qualified ``*.parquet`` URIs under ``dir_uri``, sorted by filename (part names are
+    canonical-UTC ISO, so the lexical sort is freshness order); ``[]`` when the directory is absent."""
+    fs, path, _ = _hadoop_fs(spark, dir_uri)
+    if not fs.exists(path):
+        return []
+    out = []
+    for status in fs.listStatus(path):
+        p = status.getPath()
+        if p.getName().endswith(".parquet"):
+            out.append(p.toString())
+    return sorted(out, key=lambda u: u.rsplit("/", 1)[-1])
+
+
+def _exists(spark: SparkSession, uri: str) -> bool:
+    fs, path, _ = _hadoop_fs(spark, uri)
+    return bool(fs.exists(path))
+
+
+def _sidecar_entry(spark: SparkSession, data_dir: str, table: str) -> dict:
+    text = _read_text(spark, f"{data_dir}/{SIDECAR}")
+    if text is None:
         raise FileNotFoundError(f"{data_dir}: no {SIDECAR} — not a published duckstring data dir")
-    entry = json.loads(path.read_text()).get(table)
+    entry = json.loads(text).get(table)
     if entry is None:
         raise FileNotFoundError(f"{data_dir}: table '{table}' is not in the {SIDECAR} sidecar")
     return entry
@@ -87,16 +146,15 @@ def _dt(iso: str | None) -> datetime | None:
     return datetime.fromisoformat(iso) if iso else None
 
 
-def _parts(data_dir: Path, table: str) -> list[Path]:
-    d = data_dir / table
-    return sorted(d.glob("*.parquet")) if d.is_dir() else []
+def _parts(spark: SparkSession, data_dir: str, table: str) -> list[str]:
+    return _list_parquet(spark, f"{data_dir}/{table}")
 
 
-def pin_source(ref: str) -> Pin:
+def pin_source(spark: SparkSession, ref: str) -> Pin:
     """The source's published epoch ``f`` as this run's pin — an opaque monotonic token to the
     watermark machinery (recorded, compared for the skip check, and handed back as ``last``)."""
     data_dir, table = _parse(ref)
-    f = _sidecar_entry(data_dir, table).get("f")
+    f = _sidecar_entry(spark, data_dir, table).get("f")
     if f is None:
         raise ValueError(f"{ref}: the sidecar carries no published freshness (was the Pond ever run?)")
     return Pin(version=0, table_id=f)
@@ -105,32 +163,32 @@ def pin_source(ref: str) -> Pin:
 # ─── reads ──────────────────────────────────────────────────────────────────────
 
 
-def _read_parts(spark: SparkSession, files: list[Path]) -> DataFrame:
-    return spark.read.parquet(*[str(f) for f in files])
+def _read_parts(spark: SparkSession, files: list[str]) -> DataFrame:
+    return spark.read.parquet(*files)
 
 
 def current_state(spark: SparkSession, ref: str, pin: Pin) -> DataFrame:
     """The source's clean current state as of the pinned epoch (system columns stripped)."""
     data_dir, table = _parse(ref)
-    entry = _sidecar_entry(data_dir, table)
+    entry = _sidecar_entry(spark, data_dir, table)
     f = _dt(pin.table_id)
     mode = entry.get("mode", "overwrite")
     if mode == "overwrite":
-        return spark.read.parquet(str(data_dir / f"{table}.parquet"))
+        return spark.read.parquet(f"{data_dir}/{table}.parquet")
     if mode == "append":
-        hist = _read_parts(spark, _parts(data_dir, table))
+        hist = _read_parts(spark, _parts(spark, data_dir, table))
         return hist.where(F.col(DUCK_F) <= F.lit(f)).drop(DUCK_F)
     return _reconstruct(spark, data_dir, table, entry, f)
 
 
-def _reconstruct(spark: SparkSession, data_dir: Path, table: str, entry: dict, f: datetime) -> DataFrame:
+def _reconstruct(spark: SparkSession, data_dir: str, table: str, entry: dict, f: datetime) -> DataFrame:
     """A merge main's current state: latest-per-image over the changelog tiers above ``f_base``,
     overlaid on the cold base (anti-joined by every changed key) — duckstring's reconstruct rule."""
     pk = list(entry.get("pk", ()))
     f_base = _dt(entry.get("f_base"))
-    clog_files = _parts(data_dir, f"{table}{CHANGELOG_SUFFIX}") + _parts(data_dir, f"{table}{WARM_SUFFIX}")
-    base_files = _parts(data_dir, f"{table}{BASE_SUFFIX}")
-    legacy_base = data_dir / f"{table}.parquet"
+    clog_files = _parts(spark, data_dir, f"{table}{CHANGELOG_SUFFIX}") + _parts(spark, data_dir, f"{table}{WARM_SUFFIX}")
+    base_files = _parts(spark, data_dir, f"{table}{BASE_SUFFIX}")
+    legacy_base = f"{data_dir}/{table}.parquet"
 
     net = None
     if clog_files:
@@ -142,8 +200,8 @@ def _reconstruct(spark: SparkSession, data_dir: Path, table: str, entry: dict, f
     base = None
     if base_files:
         base = _read_parts(spark, base_files).drop(DUCK_F)
-    elif legacy_base.exists():
-        base = spark.read.parquet(str(legacy_base)).drop(DUCK_F)
+    elif _exists(spark, legacy_base):
+        base = spark.read.parquet(legacy_base).drop(DUCK_F)
 
     if net is None:
         if base is None:
@@ -161,7 +219,7 @@ def delta_of_ref(spark: SparkSession, ref: str, pin: Pin, last: Pin | None, *, p
     the same ladder duckstring's own consumers ride: bootstrap, a ``floor`` above the watermark
     (refresh / retention), an overwrite source that advanced, or a window past ``p``."""
     data_dir, table = _parse(ref)
-    entry = _sidecar_entry(data_dir, table)
+    entry = _sidecar_entry(spark, data_dir, table)
     mode = entry.get("mode", "overwrite")
     f = _dt(pin.table_id)
     prev = _dt(last.table_id) if last is not None else None
@@ -175,9 +233,10 @@ def delta_of_ref(spark: SparkSession, ref: str, pin: Pin, last: Pin | None, *, p
             return Delta(zset=as_zset(current_state(spark, ref, pin)).limit(0), is_full=False)
         return full()
 
-    files = _parts(data_dir, f"{table}{CHANGELOG_SUFFIX}") if mode == "merge" else _parts(data_dir, table)
+    files = _parts(spark, data_dir, f"{table}{CHANGELOG_SUFFIX}") if mode == "merge" \
+        else _parts(spark, data_dir, table)
     if mode == "merge":
-        files = files + _parts(data_dir, f"{table}{WARM_SUFFIX}")
+        files = files + _parts(spark, data_dir, f"{table}{WARM_SUFFIX}")
     if prev is None or not files:
         return full()
     if floor is not None and prev < floor:

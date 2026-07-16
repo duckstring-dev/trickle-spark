@@ -61,6 +61,16 @@ def test_apply_changes_duplicate_landing_key_raises(spark, db):
         ts.apply_changes(spark, f"{db}.landed", zset(spark, [(1, "a"), (1, "b")]), pk=("id",))
 
 
+def test_duckstring_uri_normalisation():
+    from trickle_spark.duckstring import _spark_uri, ref_of
+
+    # credential query stripped (never resolved here), s3 mapped to the OSS connector scheme
+    assert _spark_uri("s3://bkt/ponds/x/m1/data?key_id=${env:K}&secret=${env:S}") == "s3a://bkt/ponds/x/m1/data"
+    assert _spark_uri("/local/path/") == "/local/path"
+    assert _spark_uri("abfss://c@acct.dfs.core.windows.net/p") == "abfss://c@acct.dfs.core.windows.net/p"
+    assert ref_of("s3://bkt/p?secret=${env:S}", "orders") == "duckstring:s3a://bkt/p::orders"
+
+
 def test_changes_at_tag_recovers_each_runs_change(spark, db):
     src, out = f"{db}.src", f"{db}.out"
     make_source(spark, src, [(1, "a"), (2, "b")])

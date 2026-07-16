@@ -23,7 +23,7 @@ from .zset import Delta, diff
 def pin_of(spark: SparkSession, source: str) -> Pin:
     """Pin a source for this run — a Delta table's version, or a duckstring source's published epoch."""
     if _dk.is_duckstring_ref(source):
-        return _dk.pin_source(source)
+        return _dk.pin_source(spark, source)
     return pin_table(spark, source)
 
 

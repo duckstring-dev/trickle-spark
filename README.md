@@ -143,6 +143,25 @@ ts.run(spark, "shop.clean_orders", sources=["shop.orders"], pk=("order_id",), fu
 `ctx.delta(src)` is a consolidated Z-set (`_trickle_d` = +1/−1, full row images); `ctx.new`/`ctx.old`
 are the pinned current and watermark states.
 
+### Bridging to another incremental engine
+
+The Z-set is the lingua franca, so crossing into or out of a sibling engine (say, a
+[Duckstring](https://github.com/duckstring-dev/duckstring) Trickle pipeline where one stage needs
+multinode compute) takes two primitives, both in `trickle_spark.bridge`:
+
+```python
+# inbound: land a foreign Z-set window on a Delta table — CDF re-derives the changelog from there,
+# so downstream plans are fully native. `tag` (the producer's epoch) makes replays exactly-once.
+ts.apply_changes(spark, "bridge.orders", zset, pk=("order_id",), tag=str(f))
+
+# outbound: the output's consolidated change since a pin the *consumer* remembers, plus the next pin
+delta, pin = ts.table_changes(spark, "bridge.priced", last_pin)
+```
+
+Neither engine learns the other's clock — each windows by its own axis, and the crossing carries full
+row images. A worked Duckstring↔Spark round trip (landing ripples, epoch-keyed pin bookkeeping,
+replay idempotence on both sides) is `tests/test_duckstring_bridge.py`.
+
 ## The deployment pattern ("a pond, demoted to a pattern")
 
 The engine's unit is strictly **one output table**; nothing is ever co-scheduled for correctness.
@@ -186,10 +205,11 @@ The reference implementation and behavioural oracle is duckstring's `trickle/` p
 covers the core io, the full join DAG (all six `how`s, bushy shapes, the affected-key recompute with
 a broadcast null-safe key pre-filter), aggregation — including the two-variable co-moments and the
 order-dependent `agg.reduce` — ordered scans (grouped and ungrouped), and the `.append_to` terminal
-with droplog conflict semantics. Documented follow-ups: an explicit-changelog change source
-(user-controlled epochs) behind the `delta_of` seam — pending a real cross-system use case — and the
-reference's own deferred set (skewness, holistic aggregates / `DISTINCT`), which stay a downstream
-`.sql()` step here as there.
+with droplog conflict semantics. The reserved "explicit-changelog change source" resolved into the
+**bridge pair** (`apply_changes`/`table_changes`) once the cross-system use case arrived: landing a
+foreign Z-set and letting CDF re-derive the changelog covers it without reconstruction-based read
+machinery in the engine. Remaining follow-ups are the reference's own deferred set (skewness,
+holistic aggregates / `DISTINCT`), which stay a downstream `.sql()` step here as there.
 
 ## Development
 

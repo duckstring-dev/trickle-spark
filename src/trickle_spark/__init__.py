@@ -11,10 +11,11 @@ from . import (
     agg,  # noqa: F401 - the aggregate-metric namespace (from trickle_spark import agg)
 )
 from .append import AppendConflict, run_append
+from .bridge import apply_changes, table_changes
 from .builder import Builder, BuildError, materialize, materialize_append, source
 from .changes import delta_of
 from .run import RunContext, RunResult, run
-from .tables import Pin, read_watermarks
+from .tables import Pin, pin_table, read_tag, read_watermarks
 from .zset import D_COL, SYSTEM_PREFIX, Delta, as_zset, consolidate, diff
 
 __all__ = [
@@ -27,14 +28,18 @@ __all__ = [
     "Pin",
     "RunContext",
     "RunResult",
+    "apply_changes",
     "as_zset",
     "consolidate",
     "delta_of",
     "diff",
     "materialize",
     "materialize_append",
+    "pin_table",
+    "read_tag",
     "read_watermarks",
     "run",
     "run_append",
     "source",
+    "table_changes",
 ]
